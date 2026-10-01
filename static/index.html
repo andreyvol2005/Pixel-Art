@@ -2,21 +2,32 @@
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Pixel Canvas</title>
     <link rel="icon" href="data:,">
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
     <header>
-        <h1>Pixel Canvas 100×100</h1>
-        <div class="palette" id="palette"></div>
-        <input type="color" id="customColor" value="#ff0000">
-        <span id="status">соединение…</span>
-    </header>
-    <main class="canvas-wrapper">
-        <div id="canvas" class="canvas"></div>
+    <h1>Pixel-Art Buttle</h1>
+    <div class="palette" id="palette"></div>
+    <input type="color" id="customColor" value="#ff0000">
+    <label class="borders-toggle" title="Показывать границы клеток">
+        <input type="checkbox" id="bordersToggle" checked>
+        <span class="toggle-slider"></span>
+        <span class="toggle-label">Границы</span>
+    </label>
+    <span id="online"><span id="onlineCount">0</span> онлайн</span>
+    <span id="status">соединение…</span>
+</header>
+
+    <!-- Новая структура для зума и пана -->
+    <main class="viewport" id="viewport">
+        <div class="canvas-container" id="canvasContainer">
+            <div id="canvas" class="canvas"></div>
+        </div>
     </main>
+
     <script src="/static/app.js"></script>
 </body>
 </html>

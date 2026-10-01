@@ -13,11 +13,40 @@ from .models import Base
 from .redis_client import redis_client
 from .connection import manager
 from . import canvas as canvas_module
+from sqlalchemy import text
 
 
-# ------------------------------------------------------------------ #
-#                          Lifespan                                  #
-# ------------------------------------------------------------------ #
+async def clear_canvas():
+    """Очищает холст в БД, Redis и локальном кэше"""
+    # 1. Очищаем БД
+    async with engine.begin() as conn:
+        await conn.execute(text("DELETE FROM pixels"))
+
+    # 2. Очищаем Redis-снапшот
+    await canvas_module.clear_redis_snapshot()
+
+    # 3. Очищаем локальный кэш
+    canvas_module.clear_cache()
+
+    # 4. Рассылаем команду очистки всем клиентам
+    await manager.broadcast({"action": "clear"})
+
+    print("🧹 Холст очищен (БД, Redis, кэш)")
+
+
+async def admin_listener():
+    """Слушает команды админа в терминале"""
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            command = await loop.run_in_executor(None, input)
+            if command.strip().lower() == "wipe":
+                await clear_canvas()
+        except (EOFError, KeyboardInterrupt):
+            break
+        except Exception as e:
+            print(f"Ошибка: {e}")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -27,6 +56,9 @@ async def lifespan(app: FastAPI):
 
     # инициализация холста (Postgres + Redis + локальный кэш)
     await canvas_module.init_canvas()
+
+    # запускаем слушатель команд админа
+    asyncio.create_task(admin_listener())
 
     # фоновые задачи
     flush_task = asyncio.create_task(canvas_module.flush_to_db_periodically())
@@ -56,8 +88,12 @@ async def _listen_redis():
             if message["type"] != "message":
                 continue
             try:
-                x, y, color = json.loads(message["data"])
-            except Exception:
+                data = message["data"]
+                if isinstance(data, bytes):
+                    data = data.decode('utf-8', errors='ignore')
+                x, y, color = json.loads(data)
+            except Exception as e:
+                print(f"Redis decode error: {e}")
                 continue
             await canvas_module.apply_remote_pixel(x, y, color)
             await manager.broadcast([x, y, color])
@@ -85,15 +121,25 @@ async def index():
         return f.read()
 
 
+@app.get("/admin/wipe")
+async def admin_wipe():
+    """Секретная ссылка для очистки холста"""
+    await clear_canvas()
+    return {"status": "ok", "message": "Холст очищен"}
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
-    await manager.connect(ws)
+    count = await manager.connect(ws)
     try:
-        # 1) отправляем ТОЛЬКО не-белые пиксели
+        # 1) отправляем новому клиенту текущее состояние холста
         pixels = canvas_module.get_non_default_pixels()
         await ws.send_json({"pixels": pixels})
 
-        # 2) основной цикл — принимаем [x, y, color]
+        # 2) сообщаем ВСЕМ новое количество онлайн
+        await manager.broadcast({"type": "online", "count": count})
+
+        # 3) основной цикл — принимаем [x, y, color]
         while True:
             msg = await ws.receive_json()
 
@@ -113,14 +159,14 @@ async def ws_endpoint(ws: WebSocket):
             if not (len(color) == 7 and color.startswith("#")):
                 continue
 
-            # обновляем локальный кэш
             await canvas_module.set_pixel(x, y, color)
-            # публикуем в Redis — все воркеры (включая наш) получат событие
-            # через _listen_redis и разошлют его своим клиентам
             await canvas_module.publish_pixel(x, y, color)
 
     except WebSocketDisconnect:
-        await manager.disconnect(ws)
+        pass
     except Exception as e:
         print("WS error:", e)
-        await manager.disconnect(ws)
+    finally:
+        count = await manager.disconnect(ws)
+        # сообщаем ВСЕМ новое количество онлайн
+        await manager.broadcast({"type": "online", "count": count})

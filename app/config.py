@@ -1,8 +1,6 @@
 # --- Холст ---
-CANVAS_W = 100
-CANVAS_H = 100
-
-# ВАЖНО: этот же цвет задан в CSS (.cell { background: #ffffff; }).
+CANVAS_W = 200
+CANVAS_H = 200
 DEFAULT_COLOR = "#ffffff"
 
 # --- Подключения ---
