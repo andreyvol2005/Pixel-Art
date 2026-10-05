@@ -1,0 +1,249 @@
+* { box-sizing: border-box; }
+
+html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden; /* Запрещаем скролл всей страницы */
+}
+
+body {
+    font-family: system-ui, sans-serif;
+    background: #1a1a1a;
+    color: #eee;
+    display: flex;
+    flex-direction: column;
+}
+
+header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    padding: 12px 16px;
+    background: #1a1a1a;
+    border-bottom: 1px solid #333;
+    flex-shrink: 0;
+    z-index: 10; /* Чтобы хедер был поверх холста при зуме */
+}
+
+h1 { font-size: 16px; margin: 0; white-space: nowrap; }
+
+.palette { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.swatch {
+    width: 28px;
+    height: 28px;
+    border: 2px solid transparent;
+    border-radius: 6px;
+    cursor: pointer;
+}
+.swatch.active { border-color: #fff; }
+
+#customColor {
+    width: 36px;
+    height: 32px;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    padding: 0;
+}
+
+#status { font-size: 13px; opacity: 0.7; margin-left: auto; }
+#status.online  { color: #6f6; }
+#status.offline { color: #f66; }
+
+/* ---------- Окно просмотра (Viewport) ---------- */
+.viewport {
+    flex: 1;
+    width: 100%;
+    overflow: hidden;
+    position: relative;
+    background: #111;
+    cursor: grab;
+    touch-action: none; /* КРИТИЧЕСКИ ВАЖНО: отключает стандартные жесты браузера */
+}
+
+.viewport.grabbing {
+    cursor: grabbing;
+}
+
+/* ---------- Контейнер для трансформаций ---------- */
+.canvas-container {
+    position: absolute;
+    top: 0;
+    left: 0;
+    transform-origin: 0 0; /* Масштабирование от левого верхнего угла для простой математики */
+    will-change: transform;
+}
+
+.canvas {
+    display: grid;
+    gap: 0;
+    background: #000000;
+    padding: 0;
+    grid-template-columns: repeat(400, 8px);
+    grid-auto-rows: 8px;
+}
+
+.cell {
+    width: 8px;
+    height: 8px;
+    background: #ffffff;
+    cursor: crosshair;
+    box-sizing: border-box;
+}
+
+body.show-borders .cell {
+    border: 0.5px solid #000000;
+}
+
+@media (max-width: 600px) {
+    .canvas {
+        grid-template-columns: repeat(400, 6px);
+        grid-auto-rows: 6px;
+    }
+    .cell {
+        width: 6px;
+        height: 6px;
+    }
+}
+
+/* ---------- Тумблер «Границы» ---------- */
+.borders-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    user-select: none;
+    font-size: 13px;
+    color: #ccc;
+}
+
+.borders-toggle input {
+    position: absolute;
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.toggle-slider {
+    position: relative;
+    display: inline-block;
+    width: 34px;
+    height: 18px;
+    background: #555;
+    border-radius: 9px;
+    transition: background 0.15s;
+}
+
+.toggle-slider::before {
+    content: "";
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 14px;
+    height: 14px;
+    background: #eee;
+    border-radius: 50%;
+    transition: transform 0.15s;
+}
+
+.borders-toggle input:checked + .toggle-slider {
+    background: #4a8;
+}
+
+.borders-toggle input:checked + .toggle-slider::before {
+    transform: translateX(16px);
+}
+
+.toggle-label {
+    color: #ccc;
+}
+
+#status {
+    font-size: 13px;
+    opacity: 0.7;
+}
+#status.online  { color: #6f6; }
+#status.offline { color: #f66; }
+
+#online {
+    font-size: 13px;
+    opacity: 0.7;
+    color: #ccc;
+    margin-left: auto;       /* вот это отжимает оба элемента вправо */
+}
+
+#online + #status {
+    margin-left: 12px;       /* отступ между счётчиком и статусом */
+}
+
+.swatch.eraser {
+    background: #fff;
+    background-image: linear-gradient(
+        45deg,
+        transparent 45%,
+        #f00 45%,
+        #f00 55%,
+        transparent 55%
+    );
+    border: 2px solid #555;
+}
+
+/* Кнопка-инструмент (пипетка) */
+.tool-btn {
+    width: 32px;
+    height: 32px;
+    border: 2px solid #555;
+    border-radius: 6px;
+    background: #2a2a2a;
+    color: #eee;
+    font-size: 16px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    transition: border-color 0.15s, background 0.15s;
+}
+
+.tool-btn:hover {
+    border-color: #888;
+    background: #333;
+}
+
+.tool-btn.active {
+    border-color: #4a8;
+    background: #2a4a3a;
+}
+
+/* Курсор-пипетка на холсте, когда режим активен */
+body.eyedropper-mode .cell {
+    cursor: crosshair;
+}
+
+/* Ссылка на Telegram-канал */
+.tg-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    background: linear-gradient(135deg, #229ED9, #1c7fb0);
+    color: #fff;
+    text-decoration: none;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 500;
+    white-space: nowrap;
+    transition: transform 0.15s, box-shadow 0.15s;
+    margin-left: auto; /* Прижимает ссылку вправо, если есть место */
+}
+
+.tg-link:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(34, 158, 217, 0.4);
+}
+
+.tg-link:active {
+    transform: translateY(0);
+}
