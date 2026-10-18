@@ -1,4 +1,5 @@
 # Pixel-Art Online
+<img width="1014" height="1069" alt="{E8478B6C-FCA9-4696-AC41-2A976712E2C2}" src="https://github.com/user-attachments/assets/64bc9a71-af67-464f-9506-6fa83036d0be" />
 
 Совместный пиксель-арт холст в реальном времени. Без регистрации. 400 × 400 клеток.
 
