@@ -1,99 +1,181 @@
 # Pixel-Art Online
-<img width="1014" height="1069" alt="{E8478B6C-FCA9-4696-AC41-2A976712E2C2}" src="https://github.com/user-attachments/assets/64bc9a71-af67-464f-9506-6fa83036d0be" />
 
-Совместный пиксель-арт холст в реальном времени. Без регистрации. 200 x 200 клеток.
+Совместный пиксель-арт холст в реальном времени. Без регистрации. 400 × 400 клеток.
+
+**Стек:** FastAPI · WebSocket · Redis (pub/sub) · Postgres · vanilla JS (ES-модули)
 
 ---
 
-## Установка
-
-### 1. Docker Desktop
-
-Установи и запусти: https://www.docker.com/products/docker-desktop/
-
-**Windows:** если при запуске ошибка «WSL not installed» — в PowerShell от админа:
+## Как это устроено
 
 ```
-wsl --install
+Клиент (static/)
+├── modules/transport.js  сеть: WebSocket, протокол, переподключение
+├── modules/state.js      состояние
+├── modules/canvas.js     холст и рисование
+├── modules/gestures.js   мышь, тач, pan/zoom
+├── modules/palette.js    палитра и пипетка
+├── modules/ui.js         статус, онлайн, тумблеры
+└── app.js                только сборка модулей
+
+Сервер (app/)
+├── main.py       точка сборки: роутеры, lifespan, статика. Бизнес-логики ноль
+├── api.py        HTTP: /api/config, /api/health, /api/stats, /api/admin/wipe
+├── ws.py         WebSocket: приём соединения и разбор команд
+├── schemas.py    контракт: что и в каком виде летает по сокету
+├── canvas.py     состояние холста и его сохранение
+├── admin.py      use-case очистки холста + консоль администратора
+├── realtime.py   pub/sub между воркерами и учёт онлайна
+├── visitors.py   журнал посещений
+├── db.py / models.py / redis_client.py / connection.py   инфраструктура
+└── config.py     все настройки, читаются из переменных окружения
 ```
 
-Перезагрузи ПК.
+### Где хранится холст
 
-Дождись в Docker Desktop надписи **Engine running**. Проверь:
+**Postgres — единственный источник истины.** Redis занимается только
+рассылкой событий между воркерами. Это осознанное решение: когда состояние
+лежало ещё и в снапшоте Redis, приложение читало его раньше базы, а сам
+снапшот после старта никто не обновлял — после перезапуска сервера холст
+откатывался на состояние, которое было в момент запуска.
 
-```
-docker ps
-```
+В базу пишутся **только изменившиеся клетки** (`_dirty`), а не весь холст.
+Было: upsert всех небелых клеток каждые 2 секунды от каждого воркера — два
+воркера затирали друг друга. Стало: дельта за `DB_FLUSH_INTERVAL` (по умолчанию
+0.5 с) плюс финальный сброс при остановке.
 
-### 2. Виртуальное окружение
+### Протокол
 
-**Windows:**
+Все сообщения — JSON с полями `v` (версия протокола) и `type`.
 
-```
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
+| Направление | Тип | Поля |
+|---|---|---|
+| клиент → сервер | `set_pixel` | `x`, `y`, `color` |
+| сервер → клиент | `snapshot` | `width`, `height`, `pixels` |
+| сервер → клиент | `pixel` | `x`, `y`, `color` |
+| сервер → клиент | `online` | `count` |
+| сервер → клиент | `clear` | — |
+| сервер → клиент | `error` | `detail` |
 
-**macOS / Linux:**
+Неизвестный тип и неподдерживаемая версия отбрасываются на входе, а не ломают
+разбор потока. Полная схема — `app/schemas.py`.
 
-```
-python3 -m venv .venv
-source .venv/bin/activate
-```
+---
 
-### 3. Зависимости
+## Запуск
 
-```
-pip install -r requirements.txt
-pip install greenlet
-```
+### Вариант 1. Всё одной командой
 
-### 4. Postgres и Redis
-
-Из корня проекта:
-
-```
+```bash
 docker compose up -d
 ```
 
-### 5. Сервер
+http://localhost:8000
 
+Чтобы включить очистку холста по HTTP, задайте токен:
+
+```bash
+ADMIN_TOKEN=длинная_случайная_строка docker compose up -d
 ```
+
+### Вариант 2. Локально
+
+**1. Docker Desktop** (для Postgres и Redis)
+
+**2. Зависимости**
+
+```bash
+python -m venv .venv
+```
+```powershell
+.\.venv\Scripts\Activate.ps1      # Windows
+```
+```bash
+source .venv/bin/activate          # macOS / Linux
+```
+```bash
+pip install -r requirements.txt
+```
+
+**3. Базы данных**
+
+```bash
+docker compose up -d db redis
+```
+
+**4. Сервер**
+
+```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Дождись `Application startup complete.` Терминал не закрывай.
+В консоли появится админ-команда: введите `wipe`, чтобы очистить холст,
+или `quit`, чтобы выйти из режима ожидания.
 
-### 6. Открыть
+**5. Открыть** http://localhost:8000
 
+---
+
+## Настройка
+
+Всё читается из переменных окружения, дефолты — в `app/config.py`.
+
+| Переменная | По умолчанию | Назначение |
+|---|---|---|
+| `CANVAS_W` / `CANVAS_H` | `400` / `400` | размер холста |
+| `DATABASE_URL` | `…localhost:5433/pixelcanvas` | подключение к Postgres |
+| `REDIS_URL` | `redis://localhost:6379` | подключение к Redis |
+| `DB_FLUSH_INTERVAL` | `0.5` | как часто сбрасывать дельту в базу, сек |
+| `ADMIN_TOKEN` | *(пусто)* | токен для `POST /api/admin/wipe`; пусто — эндпоинт выключен |
+| `VISITORS_LOG` | `data/visitors.log` | путь к журналу посещений |
+| `LOG_LEVEL` | `INFO` | уровень логирования |
+
+Если `ADMIN_TOKEN` не задан, `POST /api/admin/wipe` отвечает 503. Это лучше,
+чем «случайно включённая» очистка холста.
+
+```bash
+curl -X POST http://localhost:8000/api/admin/wipe \
+     -H "X-Admin-Token: $ADMIN_TOKEN"
 ```
-http://localhost:8000
+
+---
+
+## Тесты
+
+```bash
+pip install -r requirements.txt pytest pytest-asyncio httpx
+pytest -q
 ```
+
+33 теста: контракт сообщений, работа с дельтой пикселей, права на
+админские операции и полный путь команды по WebSocket. Postgres и Redis для
+них не нужны — инфраструктура подменяется фейками.
 
 ---
 
 ## Доступ с других устройств в той же Wi-Fi
 
-1. Узнай IP:
+1. Узнайте IP: `ipconfig` (Windows) или `ipconfig getifaddr en0` (macOS).
+2. Разрешите порт 8000 в брандмауэре:
 
-   **Windows:** `ipconfig` → строка IPv4-адрес.
+```powershell
+New-NetFirewallRule -DisplayName "Pixel Canvas" -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow -Profile Any
+```
 
-   **macOS:** `ipconfig getifaddr en0`
+3. Отправьте другу `http://<ваш-IP>:8000` — он должен быть в той же сети.
 
-2. Разреши порт 8000 в брандмауэре.
+---
 
-   **Windows** (PowerShell от админа):
+## Известные ограничения
 
-   ```
-   New-NetFirewallRule -DisplayName "Pixel Canvas" -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow -Profile Any
-   ```
-
-   **macOS:** при первом запуске uvicorn нажми **Allow** в системном окне.
-
-3. Отправь другу:
-
-   ```
-   http://<твой-IP>:8000
-   ```
-
-   Друг должен быть в той же Wi-Fi сети.
+- **Онлайн-счётчик** общий для всех воркеров (ZSET в Redis), но рассылка
+  событий идёт только по локальным сокетам воркера. При `--workers N`
+  переподключение клиента может попасть на другой воркер — это нормально,
+  состояние всё равно придёт через pub/sub.
+- **Журнал посещений** — обычный файл. Как только понадобится считать визиты
+  по дням или по странам, файла не хватит: см. заметку в `app/visitors.py`.
+- **Миграций нет**: схема создаётся из `models.py` при старте. Пора заводить
+  Alembic, когда появится вторая таблица.
+- **Аккаунтов нет**: каждый, кто открыл страницу, может рисовать. По сути
+  это тот же публичный доступ, что был раньше, — просто теперь очистку холста
+  не может вызвать кто попало.

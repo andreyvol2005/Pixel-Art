@@ -1,23 +1,45 @@
+"""Application-слой: состояние холста и его сохранение.
+
+Инфраструктура (Postgres, Redis) вызывается отсюда напрямую намеренно: на этом
+размере проекта репозитории были бы лишней обвязкой. Но логика хранения —
+целиком здесь, и она единственная в проекте.
+
+Источник истины — Postgres. Локальный кэш — это «горячий» буфер чтения для
+отрисовки, а не база. Раньше третьим источником был снапшот в Redis, и он
+никогда не обновлялся после старта: `init_canvas` читал его первым, поэтому после
+перезапуска приложение воскрешало состояние, отставшее на всё время работы.
+Снапшота в Redis больше нет — Redis занимается только pub/sub.
+"""
 import asyncio
-import json
-from typing import Dict, Tuple, List
+import logging
+from typing import Dict, List, Set, Tuple
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from .config import (
-    CANVAS_W, CANVAS_H, DEFAULT_COLOR,
-    REDIS_CANVAS_KEY, REDIS_CHANNEL,
+    DB_FLUSH_BATCH_SIZE,
     DB_FLUSH_INTERVAL,
+    CANVAS_H,
+    CANVAS_W,
+    DEFAULT_COLOR,
 )
 from .db import SessionLocal
 from .models import Pixel
-from .redis_client import redis_client
 
+logger = logging.getLogger(__name__)
 
 # Локальный in-memory кэш каждого воркера.
 # Ключ: (x, y) → значение: "#rrggbb"
 _local_canvas: Dict[Tuple[int, int], str] = {}
+
+# Пиксели, изменённые с прошлого сброса в базу. Именно дельта, а не весь холст:
+# раньше каждый воркер раз в 2 секунды делал upsert ВСЕХ небелых клеток, и при
+# двух воркерах они затирали друг друга по кругу (last-write-wins на всю таблицу).
+_dirty: Set[Tuple[int, int]] = set()
+
+# Асинхронный лок нужен, потому что set_pixel вызывается из обработчика сокета.
+_dirty_lock = asyncio.Lock()
 
 
 # ------------------------------------------------------------------ #
@@ -31,85 +53,65 @@ async def load_canvas_from_db() -> Dict[Tuple[int, int], str]:
         return {(row.x, row.y): row.color for row in result}
 
 
-async def save_canvas_to_db(canvas: Dict[Tuple[int, int], str]) -> None:
-    """Сохраняет в БД ТОЛЬКО не-белые клетки, батчами по 5000."""
-    values = [
-        {"x": x, "y": y, "color": c}
-        for (x, y), c in canvas.items()
-        if c != DEFAULT_COLOR
-    ]
-    if not values:
-        return
+async def save_pixels_to_db(pixels: List[Tuple[int, int, str]]) -> int:
+    """Пишет переданные пиксели пачками. Возвращает количество записей."""
+    if not pixels:
+        return 0
 
-    BATCH_SIZE = 5000
+    written = 0
     async with SessionLocal() as s:
-        for i in range(0, len(values), BATCH_SIZE):
-            batch = values[i:i + BATCH_SIZE]
-            stmt = pg_insert(Pixel).values(batch)
+        for i in range(0, len(pixels), DB_FLUSH_BATCH_SIZE):
+            batch = pixels[i:i + DB_FLUSH_BATCH_SIZE]
+            stmt = pg_insert(Pixel).values(
+                [{"x": x, "y": y, "color": c} for x, y, c in batch]
+            )
             stmt = stmt.on_conflict_do_update(
                 index_elements=["x", "y"],
                 set_={"color": stmt.excluded.color},
             )
             await s.execute(stmt)
+            written += len(batch)
         await s.commit()
+    return written
+
+
+async def delete_all_from_db() -> int:
+    async with SessionLocal() as s:
+        result = await s.execute(Pixel.__table__.delete())
+        await s.commit()
+        return result.rowcount or 0
 
 
 # ------------------------------------------------------------------ #
-#                          Работа с Redis                            #
+#                       Инициализация и доступ                        #
 # ------------------------------------------------------------------ #
 
-async def _write_canvas_to_redis(canvas: Dict[Tuple[int, int], str]) -> None:
-    """В Redis пишем только не-белые клетки."""
-    payload = [
-        [x, y, c]
-        for (x, y), c in canvas.items()
-        if c != DEFAULT_COLOR
-    ]
-    await redis_client.set(REDIS_CANVAS_KEY, json.dumps(payload))
+def _empty_canvas() -> Dict[Tuple[int, int], str]:
+    return {(x, y): DEFAULT_COLOR for x in range(CANVAS_W) for y in range(CANVAS_H)}
 
-
-async def publish_pixel(x: int, y: int, color: str) -> None:
-    await redis_client.publish(REDIS_CHANNEL, json.dumps([x, y, color]))
-
-
-# ------------------------------------------------------------------ #
-#                      Инициализация и доступ                        #
-# ------------------------------------------------------------------ #
 
 async def init_canvas() -> None:
-    """Инициализация холста при старте приложения."""
-    # 1) строим полную карту в памяти — все клетки белые
-    canvas: Dict[Tuple[int, int], str] = {
-        (x, y): DEFAULT_COLOR
-        for x in range(CANVAS_W)
-        for y in range(CANVAS_H)
-    }
-
-    # 2) пробуем загрузить не-белые клетки из Redis
-    cached = await redis_client.get(REDIS_CANVAS_KEY)
-    if cached:
-        try:
-            data = json.loads(cached)
-            for x, y, c in data:
-                canvas[(int(x), int(y))] = c
-            print(f"[init] loaded {len(data)} non-default pixels from Redis")
-        except Exception as e:
-            print("Redis cache corrupted, falling back to DB:", e)
-            cached = None
-
-    # 3) если Redis пуст — читаем не-белые клетки из БД
-    if not cached:
+    """Инициализация холста при старте приложения. База — единственный источник."""
+    canvas = _empty_canvas()
+    try:
         db_canvas = await load_canvas_from_db()
-        canvas.update(db_canvas)
-        print(f"[init] loaded {len(db_canvas)} non-default pixels from DB")
+    except Exception:
+        # Не падаем: без базы приложение всё равно должно подняться и показать
+        # пустой холст, а не упасть на старте.
+        logger.exception("Не удалось загрузить холст из БД — стартуем пустым")
+        db_canvas = {}
 
-    # 4) обновляем снапшот в Redis (в нём только не-белые)
-    await _write_canvas_to_redis(canvas)
+    canvas.update(db_canvas)
 
-    # 5) заполняем локальный кэш воркера
     _local_canvas.clear()
     _local_canvas.update(canvas)
-    print(f"[init] canvas ready: {CANVAS_W}x{CANVAS_H}")
+    async with _dirty_lock:
+        _dirty.clear()
+
+    logger.info(
+        "[init] canvas ready %dx%d, небелых клеток из БД: %d",
+        CANVAS_W, CANVAS_H, len(db_canvas),
+    )
 
 
 def get_local_canvas() -> Dict[Tuple[int, int], str]:
@@ -130,12 +132,20 @@ def get_non_default_pixels() -> List[List]:
 # ------------------------------------------------------------------ #
 
 async def set_pixel(x: int, y: int, color: str) -> None:
-    """Только локальный кэш. В Redis/БД — фоновыми задачами."""
-    _local_canvas[(x, y)] = color
+    """Пиксель поставлен локальным клиентом: обновляем кэш и помечаем в базу."""
+    coord = (x, y)
+    if _local_canvas.get(coord) == color:
+        return
+    _local_canvas[coord] = color
+    async with _dirty_lock:
+        _dirty.add(coord)
 
 
 async def apply_remote_pixel(x: int, y: int, color: str) -> None:
-    """Применяет пиксель, пришедший через pub/sub (от другого воркера)."""
+    """Пиксель пришёл через pub/sub от другого воркера.
+
+    В базу его писать не нужно: автор изменения уже пометил его у себя в _dirty.
+    """
     _local_canvas[(x, y)] = color
 
 
@@ -143,29 +153,37 @@ async def apply_remote_pixel(x: int, y: int, color: str) -> None:
 #                    Фоновая синхронизация                           #
 # ------------------------------------------------------------------ #
 
-async def flush_to_db_periodically(interval: float = DB_FLUSH_INTERVAL) -> None:
+async def flush_dirty_to_db() -> int:
+    """Выгружает в базу только те клетки, что изменились с прошлого раза."""
+    # Список и значения снимаем ПОД локом. Иначе set_pixel успевает дописать в
+    # _local_canvas после того, как _dirty очищен, — и это изменение потеряется
+    # до следующего события по этой клетке.
+    async with _dirty_lock:
+        if not _dirty:
+            return 0
+        pixels = [(x, y, _local_canvas[(x, y)]) for x, y in _dirty]
+        _dirty.clear()
+
+    return await save_pixels_to_db(pixels)
+
+
+async def flush_loop(interval: float = DB_FLUSH_INTERVAL) -> None:
+    """Фоновая задача: периодически сбрасывает дельту в базу."""
     while True:
         await asyncio.sleep(interval)
         try:
-            await save_canvas_to_db(_local_canvas)
-        except Exception as e:
-            print("DB flush error:", e)
+            await flush_dirty_to_db()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Ошибка выгрузки пикселей в БД")
 
 
-async def flush_to_redis_periodically(interval: float = DB_FLUSH_INTERVAL) -> None:
-    while True:
-        await asyncio.sleep(interval)
-        try:
-            await _write_canvas_to_redis(_local_canvas)
-        except Exception as e:
-            print("Redis flush error:", e)
-async def clear_cache() -> None:
-    """Очищает локальный in-memory кэш."""
-    _local_canvas.clear()
-    for x in range(CANVAS_W):
-        for y in range(CANVAS_H):
-            _local_canvas[(x, y)] = DEFAULT_COLOR
-
-async def clear_redis_snapshot() -> None:
-    """Очищает снапшот холста в Redis."""
-    await redis_client.set(REDIS_CANVAS_KEY, json.dumps([]))
+async def flush_and_stop() -> None:
+    """Последний сброс перед остановкой, чтобы не потерять хвост изменений."""
+    try:
+        written = await flush_dirty_to_db()
+        if written:
+            logger.info("Финальный сброс: %d пикселей", written)
+    except Exception:
+        logger.exception("Финальный сброс не удался")
